@@ -4,4 +4,3 @@ export default function handler(req, res) {
     message: "API funcionando corretamente"
   });
 }
-init: cria api gerar-pix
