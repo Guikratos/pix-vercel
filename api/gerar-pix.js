@@ -1,14 +1,12 @@
-import axios from "axios";
+const axios = require("axios");
 
-export default async function handler(req, res) {
-  // Só permite POST
+module.exports = async (req, res) => {
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Método não permitido. Use POST." });
   }
 
   try {
-    // Valor fixo: R$ 19,99 (em centavos)
-    const value = 1999;
+    const value = 1999; // R$ 19,99 em centavos
 
     const response = await axios.post(
       "https://api.pushinpay.com.br/pix/cashIn",
@@ -34,4 +32,4 @@ export default async function handler(req, res) {
       detail: error.response?.data || error.message
     });
   }
-}
+};
