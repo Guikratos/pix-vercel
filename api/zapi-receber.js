@@ -1,79 +1,74 @@
 export default async function handler(req, res) {
-  // 1) Só POST
   if (req.method !== "POST") {
-    return res.status(405).json({ error: "Use POST" });
-  }
-
-  // 2) Secret na URL (proteção)
-  const secret = req.query?.secret;
-  if (!secret || secret !== process.env.WEBHOOK_SECRET) {
-    return res.status(401).json({ error: "secret inválido" });
+    return res.status(405).json({ error: "Método não permitido" });
   }
 
   try {
-    const body = req.body || {};
+    const body = req.body;
 
-    // 3) Tenta achar o texto recebido (o Z-API pode mandar com campos diferentes)
-    const text =
-      body.text ||
-      body.body ||
-      body.message ||
-      body?.message?.text ||
-      body?.text?.message ||
-      "";
+    // Estrutura padrão Z-API
+    const phone =
+      body?.phone ||
+      body?.from ||
+      body?.data?.phone ||
+      body?.data?.from;
 
-    // 4) Tenta achar o telefone de quem mandou
-    const phoneRaw =
-      body.phone ||
-      body.from ||
-      body.sender?.phone ||
-      body?.message?.from ||
-      body?.chatId ||
-      "";
+    const message =
+      body?.message ||
+      body?.text ||
+      body?.data?.message ||
+      body?.data?.text;
 
-    const phone = String(phoneRaw).replace(/\D/g, ""); // só números
-
-    if (!phone) {
-      // Se não vier phone, devolve 200 pra Z-API não ficar tentando de novo
-      return res.status(200).json({ ok: true, note: "sem phone no payload", body });
+    if (!phone || !message) {
+      return res.status(200).json({ ok: true });
     }
 
-    // 5) Resposta simples (só pra provar que o webhook + envio estão funcionando)
-    const reply =
-      `✅ Recebi sua mensagem!\n\n` +
-      `Texto: "${text}"\n\n` +
-      `Agora me envie seu código (ex: ABC123) no formato: codigo ABC123`;
+    const code = message.trim();
 
-    // 6) Envia msg usando a API do Z-API
-    // IMPORTANTE: ZAPI_BASE_URL deve ser tipo:
-    // https://api.z-api.io/instances/SEU_ID/token/SEU_TOKEN
-    const url = `${process.env.ZAPI_BASE_URL}/send-text`;
+    // 🔐 Valida o código PIX
+    const validateResponse = await fetch(
+      `${process.env.API_BASE_URL}/api/validar-codigo`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ code }),
+      }
+    );
 
-    const resp = await fetch(url, {
+    const validation = await validateResponse.json();
+
+    let replyMessage = "";
+
+    if (validation.valid) {
+      replyMessage =
+        "✅ Pagamento confirmado!\n\n" +
+        "Seu acesso foi liberado com sucesso.\n\n" +
+        "🔓 Aqui está seu acesso exclusivo:\n" +
+        "https://SEU-LINK-DE-ACESSO-AQUI";
+    } else {
+      replyMessage =
+        "❌ Código inválido ou ainda não confirmado.\n\n" +
+        "Verifique se copiou corretamente ou aguarde alguns segundos e tente novamente.";
+    }
+
+    // 📲 Envia resposta pelo Z-API
+    await fetch(`${process.env.ZAPI_BASE_URL}/send-text`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "client-token": process.env.ZAPI_CLIENT_TOKEN || "",
+        "client-token": process.env.ZAPI_CLIENT_TOKEN,
       },
       body: JSON.stringify({
-        phone, // ex: 5527996941822
-        message: reply,
+        phone,
+        message: replyMessage,
       }),
     });
 
-    const data = await resp.text();
-
-    if (!resp.ok) {
-      return res.status(200).json({
-        ok: false,
-        error: "Falha ao enviar no Z-API",
-        status: resp.status,
-        details: data,
-      });
-    }
-
-    return res.status(200).json({ ok: true, sent: true });
-  } catch (e) {
-    return res.status(500).json({ error: "crash", detail: e?.message });
+    return res.status(200).json({ success: true });
+  } catch (err) {
+    console.error("Erro no zapi-receber:", err);
+    return res.status(200).json({ ok: true });
   }
 }
