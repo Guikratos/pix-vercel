@@ -12,7 +12,7 @@ export default async function handler(req, res) {
       } catch (_) {}
     }
 
-    // ✅ LOG 1 (logo após parse do body)
+    // ✅ LOG 1
     console.log("BODY:", JSON.stringify(body));
 
     // --- extrair phone (vários formatos possíveis) ---
@@ -24,9 +24,10 @@ export default async function handler(req, res) {
       body?.sender?.phone ??
       body?.message?.phone ??
       body?.messages?.[0]?.from ??
+      body?.data?.phoneNumber ??
+      body?.data?.participantPhone ??
       "";
 
-    // normaliza para somente dígitos (remove +, @c.us etc)
     const phone = String(rawPhone).replace(/\D/g, "");
 
     // --- extrair message (vários formatos possíveis) ---
@@ -42,27 +43,27 @@ export default async function handler(req, res) {
       body?.messages?.[0]?.message ??
       body?.messages?.[0]?.body ??
       body?.messages?.[0]?.content ??
+      body?.text?.message ?? // ✅ (no seu log apareceu text: { message: "teste123" })
       "";
 
-    // ✅ LOG 2 (rawMsg antes de normalizar)
+    // ✅ LOG 2
     console.log("RAW MSG:", rawMsg);
 
     // transforma em string com segurança
     let message = "";
     if (typeof rawMsg === "string") message = rawMsg;
     else if (rawMsg && typeof rawMsg === "object") {
-      // tenta achar texto dentro do objeto
       message = String(
-        rawMsg.text ?? rawMsg.body ?? rawMsg.message ?? rawMsg.caption ?? ""
+        rawMsg.message ?? rawMsg.text ?? rawMsg.body ?? rawMsg.caption ?? ""
       );
     } else {
       message = String(rawMsg ?? "");
     }
 
-    // ✅ LOG 3 (mensagem final)
+    // ✅ LOG 3
     console.log("MSG FINAL:", message);
 
-    // se não tiver phone ou msg, só responde ok pra Z-API não ficar insistindo
+    // se não tiver phone ou msg, responde ok
     if (!phone || !message) {
       return res.status(200).json({ ok: true });
     }
@@ -70,15 +71,14 @@ export default async function handler(req, res) {
     const code = message.trim();
     if (!code) return res.status(200).json({ ok: true });
 
-    // 🔐 Valida o código PIX (sua API na Vercel)
-    const validateResponse = await fetch(
-      `${process.env.API_BASE_URL}/api/validar-codigo`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ code }),
-      }
-    );
+    // 🔐 Valida o código PIX (na própria Vercel)
+    const baseUrl = `https://${req.headers.host}`;
+
+    const validateResponse = await fetch(`${baseUrl}/api/validar-codigo`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code }),
+    });
 
     const validation = await validateResponse.json().catch(() => ({}));
 
@@ -108,13 +108,12 @@ export default async function handler(req, res) {
       }),
     });
 
-    // log opcional do retorno da Z-API (ajuda a saber se enviou mesmo)
     const zapiText = await zapiResp.text().catch(() => "");
     console.log("ZAPI STATUS:", zapiResp.status, "ZAPI BODY:", zapiText);
 
     return res.status(200).json({ success: true });
   } catch (err) {
-    console.error("Erro no zapi-receiver:", err);
+    console.error("Erro no zapi-receive:", err);
     return res.status(200).json({ ok: true });
   }
 }
