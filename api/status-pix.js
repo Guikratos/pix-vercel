@@ -1,7 +1,9 @@
 const axios = require("axios");
 
 async function redisGet(key) {
-  const url = `${process.env.UPSTASH_REDIS_REST_URL}/get/${encodeURIComponent(key)}`;
+  const url = `${process.env.UPSTASH_REDIS_REST_URL}/get/${encodeURIComponent(
+    key
+  )}`;
   const r = await fetch(url, {
     headers: { Authorization: `Bearer ${process.env.UPSTASH_REDIS_REST_TOKEN}` },
   });
@@ -11,18 +13,47 @@ async function redisGet(key) {
 }
 
 async function redisSet(key, value) {
-  const url = `${process.env.UPSTASH_REDIS_REST_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(value)}`;
+  const url = `${process.env.UPSTASH_REDIS_REST_URL}/set/${encodeURIComponent(
+    key
+  )}/${encodeURIComponent(value)}`;
   const r = await fetch(url, {
     headers: { Authorization: `Bearer ${process.env.UPSTASH_REDIS_REST_TOKEN}` },
   });
   if (!r.ok) throw new Error(`Upstash SET failed: ${await r.text()}`);
 }
 
+function normalizeStatus(raw) {
+  const s = String(raw || "").toLowerCase();
+
+  const paid = new Set([
+    "paid",
+    "approved",
+    "confirmed",
+    "completed",
+    "success",
+    "succeeded",
+    "paid_out",
+    "settled",
+  ]);
+
+  const pending = new Set(["created", "pending", "waiting", "processing"]);
+
+  const canceled = new Set(["canceled", "cancelled", "refused", "expired"]);
+
+  if (paid.has(s)) return "paid";
+  if (canceled.has(s)) return "canceled";
+  if (pending.has(s) || !s) return "pending";
+  return s; // fallback
+}
+
 module.exports = async (req, res) => {
   // CORS (Bolt/qualquer domínio)
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization"
+  );
 
   if (req.method === "OPTIONS") return res.status(204).end();
 
@@ -30,13 +61,30 @@ module.exports = async (req, res) => {
   if (!id) return res.status(400).json({ error: "Faltou id" });
 
   try {
-    // 1) Se já estiver pago no Redis, retorna na hora
+    // ✅ 1) cache no Redis (retorna o que tiver salvo)
     const cached = await redisGet(`pix:${id}:status`);
-    if (cached === "paid") return res.status(200).json({ id, status: "paid" });
+    if (cached) {
+      const norm = normalizeStatus(cached);
+      // se já tem paid/canceled/pending no redis, devolve direto
+      if (norm === "paid" || norm === "canceled") {
+        return res.status(200).json({ id, status: norm });
+      }
+      // se for pending, ainda assim vamos tentar consultar a PushinPay
+      // (pra acelerar a virada pra paid)
+    }
 
-    // 2) Consulta o status na PushinPay (endpoint correto)
-    // Doc: GET /transaction/{id}
-    const url = `https://api.pushinpay.com.br/api/transaction/${encodeURIComponent(id)}`;
+    // ✅ 2) Consulta o status na PushinPay
+    if (!process.env.PUSHINPAY_TOKEN) {
+      return res.status(500).json({
+        id,
+        status: cached ? normalizeStatus(cached) : "pending",
+        error: "Env PUSHINPAY_TOKEN não definida na Vercel",
+      });
+    }
+
+    const url = `https://api.pushinpay.com.br/api/transaction/${encodeURIComponent(
+      id
+    )}`;
 
     const r = await axios.get(url, {
       headers: {
@@ -46,25 +94,24 @@ module.exports = async (req, res) => {
       timeout: 15000,
     });
 
-    // Status vem como created | paid | canceled (doc)
-    const statusRaw = String(r.data?.status || "").toLowerCase();
-
-    // Salva resposta pra debug (ajuda se algo mudar no retorno)
+    // salva resposta pra debug (pra você inspecionar no Upstash)
     await redisSet(`pix:${id}:pushinpay`, JSON.stringify(r.data));
 
-    if (statusRaw === "paid") {
-      await redisSet(`pix:${id}:status`, "paid");
-      return res.status(200).json({ id, status: "paid" });
-    }
+    // tenta status em vários lugares (pra não quebrar se mudarem o formato)
+    const statusRaw =
+      r.data?.status ??
+      r.data?.payment_status ??
+      r.data?.data?.status ??
+      r.data?.data?.payment_status;
 
-    if (statusRaw === "canceled") {
-      await redisSet(`pix:${id}:status`, "canceled");
-      return res.status(200).json({ id, status: "canceled" });
-    }
+    const status = normalizeStatus(statusRaw);
 
-    return res.status(200).json({ id, status: "pending" });
+    // ✅ 3) Persistir no Redis (principalmente quando virar paid/canceled)
+    await redisSet(`pix:${id}:status`, status);
+
+    return res.status(200).json({ id, status });
   } catch (e) {
-    // Não quebra o front — continua como pending
+    // Não quebra o front — retorna pending, mas com detalhe pra debug
     return res.status(200).json({
       id,
       status: "pending",
