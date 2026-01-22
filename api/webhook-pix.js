@@ -1,5 +1,4 @@
 // /api/webhook-pix.js
-// Salva no Upstash (Redis) via REST
 
 async function redisSet(key, value) {
   const url = `${process.env.UPSTASH_REDIS_REST_URL}/set/${encodeURIComponent(
@@ -7,9 +6,7 @@ async function redisSet(key, value) {
   )}/${encodeURIComponent(value)}`;
 
   const r = await fetch(url, {
-    headers: {
-      Authorization: `Bearer ${process.env.UPSTASH_REDIS_REST_TOKEN}`,
-    },
+    headers: { Authorization: `Bearer ${process.env.UPSTASH_REDIS_REST_TOKEN}` },
   });
 
   if (!r.ok) throw new Error(`Upstash SET failed: ${await r.text()}`);
@@ -22,10 +19,7 @@ function pickFirst(obj, paths) {
     let ok = true;
     for (const part of parts) {
       if (cur && Object.prototype.hasOwnProperty.call(cur, part)) cur = cur[part];
-      else {
-        ok = false;
-        break;
-      }
+      else { ok = false; break; }
     }
     if (ok && cur != null && cur !== "") return cur;
   }
@@ -33,7 +27,7 @@ function pickFirst(obj, paths) {
 }
 
 module.exports = async (req, res) => {
-  // CORS (debug / chamadas cross-domain não devem quebrar)
+  // opcional (debug)
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
   res.setHeader(
@@ -43,7 +37,6 @@ module.exports = async (req, res) => {
 
   if (req.method === "OPTIONS") return res.status(204).end();
 
-  // GET só pra você testar se está online
   if (req.method === "GET") {
     return res.status(200).json({ ok: true, hint: "Webhook online. Use POST." });
   }
@@ -53,64 +46,41 @@ module.exports = async (req, res) => {
   }
 
   try {
-    // ✅ 1) valida header x-pushinpay-token (segurança da PushinPay)
-    // Node normaliza headers para lowercase
-    const pushToken = req.headers["x-pushinpay-token"];
-    if (!process.env.PUSHINPAY_WEBHOOK_TOKEN) {
-      await redisSet(
-        "pix:last_webhook_missing_env_push_token",
-        JSON.stringify({ msg: "Env PUSHINPAY_WEBHOOK_TOKEN não definida" })
-      );
-      return res.status(500).json({
-        error: "Env PUSHINPAY_WEBHOOK_TOKEN não definida na Vercel",
-      });
-    }
-
-    if (!pushToken || pushToken !== process.env.PUSHINPAY_WEBHOOK_TOKEN) {
-      await redisSet(
-        "pix:last_webhook_invalid_push_token",
-        JSON.stringify({
-          received: pushToken ? "present" : "missing",
-          headerKeys: Object.keys(req.headers || {}),
-        })
-      );
-      return res.status(401).json({ error: "Token PushinPay inválido" });
-    }
-
-    // ✅ 2) valida secret na URL (camada extra)
-    const secret = req.query?.secret;
-    if (!process.env.WEBHOOK_SECRET) {
-      await redisSet(
-        "pix:last_webhook_missing_env_secret",
-        JSON.stringify({ msg: "Env WEBHOOK_SECRET não definida" })
-      );
-      return res.status(500).json({
-        error: "Env WEBHOOK_SECRET não definida na Vercel",
-      });
-    }
-
-    if (!secret || secret !== process.env.WEBHOOK_SECRET) {
-      await redisSet(
-        "pix:last_webhook_invalid_secret",
-        JSON.stringify({ query: req.query })
-      );
-      return res.status(401).json({ error: "Webhook secret inválido" });
-    }
-
     // Body pode chegar string
     let body = req.body;
     if (typeof body === "string") {
-      try {
-        body = JSON.parse(body);
-      } catch (_) {}
+      try { body = JSON.parse(body); } catch (_) {}
     }
     body = body || {};
 
-    // Logs úteis
-    console.log("WEBHOOK QUERY:", req.query);
-    console.log("WEBHOOK BODY:", JSON.stringify(body));
+    // ---- AUTH: aceita por SECRET (query) OU por HEADER (x-pushinpay-token)
+    const secret = req.query?.secret;
+    const pushToken =
+      req.headers["x-pushinpay-token"] || req.headers["X-Pushinpay-Token"];
 
-    // Tenta achar ID
+    const okBySecret =
+      secret && process.env.WEBHOOK_SECRET && secret === process.env.WEBHOOK_SECRET;
+
+    const okByHeader =
+      pushToken &&
+      process.env.PUSHINPAY_WEBHOOK_TOKEN &&
+      pushToken === process.env.PUSHINPAY_WEBHOOK_TOKEN;
+
+    if (!okBySecret && !okByHeader) {
+      // salva tentativa pra debug
+      await redisSet(
+        "pix:last_webhook_unauthorized",
+        JSON.stringify({
+          query: req.query,
+          hasSecret: !!secret,
+          hasHeader: !!pushToken,
+          body,
+        })
+      );
+      return res.status(401).json({ error: "Webhook não autorizado" });
+    }
+
+    // ID
     const id = pickFirst(body, [
       "id",
       "transaction_id",
@@ -125,7 +95,7 @@ module.exports = async (req, res) => {
       "pix.id",
     ]);
 
-    // Tenta achar status
+    // status
     const statusRaw = String(
       pickFirst(body, [
         "status",
@@ -143,7 +113,6 @@ module.exports = async (req, res) => {
       return res.status(400).json({ error: "Webhook sem id" });
     }
 
-    // Normaliza status (inclui os que a PushinPay costuma usar)
     const paidStatuses = new Set([
       "paid",
       "approved",
@@ -155,17 +124,8 @@ module.exports = async (req, res) => {
       "settled",
     ]);
 
-    const pendingStatuses = new Set(["created", "pending", "waiting", "processing"]);
+    const finalStatus = paidStatuses.has(statusRaw) ? "paid" : statusRaw || "unknown";
 
-    const canceledStatuses = new Set(["canceled", "cancelled", "refused", "expired"]);
-
-    let finalStatus = "unknown";
-    if (paidStatuses.has(statusRaw)) finalStatus = "paid";
-    else if (pendingStatuses.has(statusRaw)) finalStatus = "pending";
-    else if (canceledStatuses.has(statusRaw)) finalStatus = "canceled";
-    else finalStatus = statusRaw || "unknown";
-
-    // Salva status + payload
     await redisSet(`pix:${id}:status`, finalStatus);
     await redisSet(`pix:${id}:payload`, JSON.stringify(body));
     await redisSet(`pix:last_webhook_ok`, JSON.stringify({ id, status: finalStatus }));
