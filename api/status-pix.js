@@ -1,121 +1,72 @@
+// /api/gerar-pix.js
 const axios = require("axios");
 
-async function redisGet(key) {
-  const url = `${process.env.UPSTASH_REDIS_REST_URL}/get/${encodeURIComponent(
-    key
-  )}`;
-  const r = await fetch(url, {
-    headers: { Authorization: `Bearer ${process.env.UPSTASH_REDIS_REST_TOKEN}` },
-  });
-  if (!r.ok) throw new Error(`Upstash GET failed: ${await r.text()}`);
-  const data = await r.json();
-  return data?.result ?? null;
-}
-
-async function redisSet(key, value) {
-  const url = `${process.env.UPSTASH_REDIS_REST_URL}/set/${encodeURIComponent(
-    key
-  )}/${encodeURIComponent(value)}`;
-  const r = await fetch(url, {
-    headers: { Authorization: `Bearer ${process.env.UPSTASH_REDIS_REST_TOKEN}` },
-  });
-  if (!r.ok) throw new Error(`Upstash SET failed: ${await r.text()}`);
-}
-
-function normalizeStatus(raw) {
-  const s = String(raw || "").toLowerCase();
-
-  const paid = new Set([
-    "paid",
-    "approved",
-    "confirmed",
-    "completed",
-    "success",
-    "succeeded",
-    "paid_out",
-    "settled",
-  ]);
-
-  const pending = new Set(["created", "pending", "waiting", "processing"]);
-
-  const canceled = new Set(["canceled", "cancelled", "refused", "expired"]);
-
-  if (paid.has(s)) return "paid";
-  if (canceled.has(s)) return "canceled";
-  if (pending.has(s) || !s) return "pending";
-  return s; // fallback
-}
-
 module.exports = async (req, res) => {
-  // CORS (Bolt/qualquer domínio)
+  // CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    "Content-Type, Authorization"
-  );
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 
   if (req.method === "OPTIONS") return res.status(204).end();
 
-  const id = req.query?.id;
-  if (!id) return res.status(400).json({ error: "Faltou id" });
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Método não permitido. Use POST." });
+  }
 
   try {
-    // ✅ 1) cache no Redis (retorna o que tiver salvo)
-    const cached = await redisGet(`pix:${id}:status`);
-    if (cached) {
-      const norm = normalizeStatus(cached);
-      // se já tem paid/canceled/pending no redis, devolve direto
-      if (norm === "paid" || norm === "canceled") {
-        return res.status(200).json({ id, status: norm });
-      }
-      // se for pending, ainda assim vamos tentar consultar a PushinPay
-      // (pra acelerar a virada pra paid)
-    }
-
-    // ✅ 2) Consulta o status na PushinPay
     if (!process.env.PUSHINPAY_TOKEN) {
+      return res.status(500).json({ error: "PUSHINPAY_TOKEN não encontrado" });
+    }
+    if (!process.env.APP_URL) {
       return res.status(500).json({
-        id,
-        status: cached ? normalizeStatus(cached) : "pending",
-        error: "Env PUSHINPAY_TOKEN não definida na Vercel",
+        error: "APP_URL não encontrado (ex: https://pix-vercel-henna.vercel.app)",
       });
     }
+    if (!process.env.WEBHOOK_SECRET) {
+      return res.status(500).json({ error: "WEBHOOK_SECRET não encontrado" });
+    }
 
-    const url = `https://api.pushinpay.com.br/api/transaction/${encodeURIComponent(
-      id
-    )}`;
+    // body pode vir string
+    let body = req.body;
+    if (typeof body === "string") {
+      try { body = JSON.parse(body); } catch (_) {}
+    }
+    body = body || {};
 
-    const r = await axios.get(url, {
-      headers: {
-        Authorization: `Bearer ${process.env.PUSHINPAY_TOKEN}`,
-        Accept: "application/json",
-      },
-      timeout: 15000,
-    });
+    const valor = Number(body?.valor ?? 19.99);
+    const value = Math.round(valor * 100);
 
-    // salva resposta pra debug (pra você inspecionar no Upstash)
-    await redisSet(`pix:${id}:pushinpay`, JSON.stringify(r.data));
+    const payload = {
+      value,
+      split_rules: [],
+      webhook_url: `${process.env.APP_URL}/api/webhook-pix?secret=${encodeURIComponent(
+        process.env.WEBHOOK_SECRET
+      )}`,
+    };
 
-    // tenta status em vários lugares (pra não quebrar se mudarem o formato)
-    const statusRaw =
-      r.data?.status ??
-      r.data?.payment_status ??
-      r.data?.data?.status ??
-      r.data?.data?.payment_status;
+    console.log("GERAR PIX payload:", payload);
 
-    const status = normalizeStatus(statusRaw);
+    const response = await axios.post(
+      "https://api.pushinpay.com.br/api/pix/cashIn",
+      payload,
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.PUSHINPAY_TOKEN}`,
+          Accept: "application/json",
+          "Content-Type": "application/json",
+        },
+        timeout: 15000,
+      }
+    );
 
-    // ✅ 3) Persistir no Redis (principalmente quando virar paid/canceled)
-    await redisSet(`pix:${id}:status`, status);
+    console.log("GERAR PIX response:", response.data);
 
-    return res.status(200).json({ id, status });
-  } catch (e) {
-    // Não quebra o front — retorna pending, mas com detalhe pra debug
-    return res.status(200).json({
-      id,
-      status: "pending",
-      detail: e.response?.data || e.message,
+    return res.status(200).json(response.data);
+  } catch (error) {
+    console.error("Erro ao gerar PIX:", error.response?.data || error.message);
+    return res.status(500).json({
+      error: "Erro ao gerar PIX",
+      detail: error.response?.data || error.message,
     });
   }
 };
