@@ -18,7 +18,6 @@ module.exports = async (req, res) => {
   }
 
   try {
-    // ✅ checagens de env
     if (!process.env.PUSHINPAY_TOKEN) {
       return res.status(500).json({
         error: "Variável PUSHINPAY_TOKEN não encontrada na Vercel",
@@ -27,8 +26,14 @@ module.exports = async (req, res) => {
 
     if (!process.env.APP_URL) {
       return res.status(500).json({
-        error:
-          "Variável APP_URL não encontrada na Vercel (ex: https://pix-vercel-henna.vercel.app)",
+        error: "Variável APP_URL não encontrada na Vercel (ex: https://pix-vercel-henna.vercel.app)",
+      });
+    }
+
+    // ✅ para garantir que o webhook sempre seja aceito
+    if (!process.env.WEBHOOK_SECRET) {
+      return res.status(500).json({
+        error: "Variável WEBHOOK_SECRET não encontrada na Vercel",
       });
     }
 
@@ -41,15 +46,18 @@ module.exports = async (req, res) => {
     }
     body = body || {};
 
-    // aceita valor vindo do front, mas usa fallback 19.99
+    // valor vindo do front -> centavos
     const valor = Number(body?.valor ?? 19.99);
-    const value = Math.round(valor * 100); // centavos
+    const value = Math.round(valor * 100);
 
-    // ✅ payload correto (SEM duplicar webhook_url)
+    // remove barra no final do APP_URL se tiver
+    const appUrl = String(process.env.APP_URL).replace(/\/$/, "");
+
     const payload = {
       value,
       split_rules: [],
-      webhook_url: `${process.env.APP_URL}/api/webhook-pix`,
+      // ✅ GARANTE autenticação pelo secret (mesmo se não vier header)
+      webhook_url: `${appUrl}/api/webhook-pix?secret=${encodeURIComponent(process.env.WEBHOOK_SECRET)}`,
     };
 
     console.log("GERAR PIX payload:", payload);
