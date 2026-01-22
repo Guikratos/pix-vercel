@@ -1,3 +1,4 @@
+// /api/gerar-pix.js
 const axios = require("axios");
 
 module.exports = async (req, res) => {
@@ -17,35 +18,38 @@ module.exports = async (req, res) => {
   }
 
   try {
+    // ✅ checagens de env
     if (!process.env.PUSHINPAY_TOKEN) {
       return res.status(500).json({
         error: "Variável PUSHINPAY_TOKEN não encontrada na Vercel",
       });
     }
 
-    if (!process.env.WEBHOOK_SECRET) {
+    if (!process.env.APP_URL) {
       return res.status(500).json({
-        error: "Variável WEBHOOK_SECRET não encontrada na Vercel",
+        error:
+          "Variável APP_URL não encontrada na Vercel (ex: https://pix-vercel-henna.vercel.app)",
       });
     }
 
-    // ✅ domínio FIXO da sua API (não depende de req.headers.host)
-    const appUrl = (process.env.APP_URL || "").replace(/\/$/, "");
-    if (!appUrl) {
-      return res.status(500).json({
-        error: "Variável APP_URL não encontrada na Vercel (ex: https://pix-vercel-henna.vercel.app)",
-      });
+    // Às vezes o body chega como string
+    let body = req.body;
+    if (typeof body === "string") {
+      try {
+        body = JSON.parse(body);
+      } catch (_) {}
     }
+    body = body || {};
 
     // aceita valor vindo do front, mas usa fallback 19.99
-    const valor = Number(req.body?.valor ?? 19.99);
+    const valor = Number(body?.valor ?? 19.99);
     const value = Math.round(valor * 100); // centavos
 
+    // ✅ payload correto (SEM duplicar webhook_url)
     const payload = {
       value,
       split_rules: [],
-      // ✅ webhook direto na geração
-      webhook_url: `${appUrl}/api/webhook-pix?secret=${process.env.WEBHOOK_SECRET}`,
+      webhook_url: `${process.env.APP_URL}/api/webhook-pix`,
     };
 
     console.log("GERAR PIX payload:", payload);
@@ -59,6 +63,7 @@ module.exports = async (req, res) => {
           Accept: "application/json",
           "Content-Type": "application/json",
         },
+        timeout: 15000,
       }
     );
 
@@ -66,7 +71,7 @@ module.exports = async (req, res) => {
 
     return res.status(200).json(response.data);
   } catch (error) {
-    console.error("ERRO gerar-pix:", error.response?.data || error.message);
+    console.error("Erro ao gerar PIX:", error.response?.data || error.message);
 
     return res.status(500).json({
       error: "Erro ao gerar PIX",
