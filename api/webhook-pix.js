@@ -12,18 +12,6 @@ async function redisSet(key, value) {
   if (!r.ok) throw new Error(`Upstash SET failed: ${await r.text()}`);
 }
 
-async function redisGet(key) {
-  const url = `${process.env.UPSTASH_REDIS_REST_URL}/get/${encodeURIComponent(
-    key
-  )}`;
-  const r = await fetch(url, {
-    headers: { Authorization: `Bearer ${process.env.UPSTASH_REDIS_REST_TOKEN}` },
-  });
-  if (!r.ok) throw new Error(`Upstash GET failed: ${await r.text()}`);
-  const data = await r.json();
-  return data?.result ?? null;
-}
-
 function pickFirst(obj, paths) {
   for (const p of paths) {
     const parts = p.split(".");
@@ -31,10 +19,7 @@ function pickFirst(obj, paths) {
     let ok = true;
     for (const part of parts) {
       if (cur && Object.prototype.hasOwnProperty.call(cur, part)) cur = cur[part];
-      else {
-        ok = false;
-        break;
-      }
+      else { ok = false; break; }
     }
     if (ok && cur != null && cur !== "") return cur;
   }
@@ -42,81 +27,53 @@ function pickFirst(obj, paths) {
 }
 
 module.exports = async (req, res) => {
-  // debug
+  // CORS (debug)
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    "Content-Type, x-pushinpay-token"
-  );
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, x-pushinpay-token");
 
   if (req.method === "OPTIONS") return res.status(204).end();
-  if (req.method === "GET")
+
+  // GET só pra testar se está online
+  if (req.method === "GET") {
     return res.status(200).json({ ok: true, hint: "Webhook online. Use POST." });
-  if (req.method !== "POST")
+  }
+
+  if (req.method !== "POST") {
     return res.status(405).json({ error: "Use POST" });
+  }
 
   try {
-    // Body pode chegar string
     let body = req.body;
     if (typeof body === "string") {
-      try {
-        body = JSON.parse(body);
-      } catch (_) {}
+      try { body = JSON.parse(body); } catch (_) {}
     }
     body = body || {};
 
-    // ✅ AUTH (aceita SECRET na URL OU header x-pushinpay-token)
-    const secret = req.query?.secret;
+    // autenticação por header
     const pushToken = req.headers["x-pushinpay-token"];
-
-    const okBySecret =
-      secret && process.env.WEBHOOK_SECRET && secret === process.env.WEBHOOK_SECRET;
-
-    const okByHeader =
-      pushToken &&
-      process.env.PUSHINPAY_WEBHOOK_TOKEN &&
-      pushToken === process.env.PUSHINPAY_WEBHOOK_TOKEN;
-
-    if (!okBySecret && !okByHeader) {
+    if (!pushToken || pushToken !== process.env.PUSHINPAY_WEBHOOK_TOKEN) {
       await redisSet(
         "pix:last_webhook_unauthorized",
-        JSON.stringify({
-          query: req.query,
-          hasSecret: !!secret,
-          hasHeader: !!pushToken,
-          headers: { "x-pushinpay-token": pushToken ? "present" : "missing" },
-          body,
-        })
+        JSON.stringify({ hasHeader: !!pushToken, body })
       );
-      return res.status(401).json({ error: "Webhook não autorizado" });
+      return res.status(401).json({ error: "Token PushinPay inválido" });
     }
 
-    // ID bruto vindo do provedor
-    const rawId = pickFirst(body, [
+    const id = pickFirst(body, [
       "id",
       "transaction_id",
       "pix_id",
       "payment_id",
       "data.id",
-      "data.transaction_id",
       "data.payment_id",
-      "data.pix_id",
+      "data.transaction_id",
       "data.payment.id",
       "data.pix.id",
       "payment.id",
       "pix.id",
     ]);
 
-    if (!rawId) {
-      await redisSet("pix:last_webhook_no_id", JSON.stringify(body));
-      return res.status(400).json({ error: "Webhook sem id" });
-    }
-
-    // ✅ resolve ID canônico via mapa
-    const canonical = (await redisGet(`map:${rawId}`)) || String(rawId);
-
-    // status
     const statusRaw = String(
       pickFirst(body, [
         "status",
@@ -129,6 +86,11 @@ module.exports = async (req, res) => {
       ]) || ""
     ).toLowerCase();
 
+    if (!id) {
+      await redisSet("pix:last_webhook_no_id", JSON.stringify(body));
+      return res.status(400).json({ error: "Webhook sem id" });
+    }
+
     const paidStatuses = new Set([
       "paid",
       "approved",
@@ -140,21 +102,15 @@ module.exports = async (req, res) => {
       "settled",
     ]);
 
-    const finalStatus = paidStatuses.has(statusRaw)
-      ? "paid"
-      : statusRaw || "unknown";
+    const finalStatus = paidStatuses.has(statusRaw) ? "paid" : (statusRaw || "unknown");
 
-    // grava SEMPRE no canônico
-    await redisSet(`pix:${canonical}:status`, finalStatus);
-    await redisSet(`pix:${canonical}:payload`, JSON.stringify(body));
-    await redisSet(
-      `pix:last_webhook_ok`,
-      JSON.stringify({ rawId, canonical, statusRaw, finalStatus })
-    );
+    await redisSet(`pix:${id}:status`, finalStatus);
+    await redisSet(`pix:${id}:payload`, JSON.stringify(body));
+    await redisSet(`pix:last_webhook_ok`, JSON.stringify({ id, status: finalStatus }));
 
-    console.log("WEBHOOK OK:", { rawId, canonical, statusRaw, finalStatus });
+    console.log("WEBHOOK OK:", { id, statusRaw, finalStatus });
 
-    return res.status(200).json({ ok: true, id: canonical, status: finalStatus });
+    return res.status(200).json({ ok: true, id, status: finalStatus });
   } catch (e) {
     console.error("Erro no webhook:", e);
     return res.status(500).json({ error: "Erro no webhook", detail: e.message });
